@@ -93,7 +93,7 @@ pub fn run_server_stdio() -> Result<()> {
     });
 
     let server = Server::new(out_tx, in_rx);
-    runtime.block_on(server.main_loop())?;
+    runtime.block_on(server.main_loop());
 
     tracing::info!("Leaving main loop");
     Ok(())

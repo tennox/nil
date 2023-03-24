@@ -1,4 +1,4 @@
-use crate::cfield2pabilities::server_capabilities;
+use crate::capabilities::server_capabilities;
 use crate::config::{Config, CONFIG_KEY};
 use crate::{convert, handler, lsp_ext, LspError, UrlExt, Vfs, MAX_FILE_LEN};
 use anyhow::{anyhow, bail, Context, Result};
@@ -7,8 +7,8 @@ use lsp_server::{ErrorCode, Message, Notification, ReqQueue, Request, RequestId,
 use lsp_types::notification::Notification as _;
 use lsp_types::{
     notification as notif, request as req, ConfigurationItem, ConfigurationParams, Diagnostic,
-    InitializeParams, MessageType, NumberOrString, PublishDiagnosticsParams, ShowMessageParams,
-    Url,
+    InitializeParams, InitializeResult, MessageType, NumberOrString, PublishDiagnosticsParams,
+    ServerInfo, ShowMessageParams, Url,
 };
 use nix_interop::nixos_options::NixosOptions;
 use nix_interop::{flake_lock, FLAKE_FILE, FLAKE_LOCK_FILE};
@@ -48,6 +48,17 @@ enum LoadFlakeResult {
         missing_inputs: bool,
     },
     NotFlake,
+}
+
+enum ProtocolError {
+    Send(mpsc::error::SendError<Message>),
+    Recv,
+}
+
+impl From<mpsc::error::SendError<Message>> for ProtocolError {
+    fn from(err: mpsc::error::SendError<Message>) -> Self {
+        Self::Send(err)
+    }
 }
 
 pub struct Server {
@@ -105,10 +116,10 @@ impl Server {
         }
     }
 
-    pub async fn main_loop(mut self) {
-        loop {
-            match self.lsp_rx.recv().await.expect("Channel closed") {
-                Message::Notification(n) if n.method == notif::Exit::METHOD => return,
+    pub async fn main_loop(mut self) -> Result<(), ProtocolError> {
+        while let Some(msg) = self.lsp_rx.recv().await {
+            match msg {
+                Message::Notification(n) if n.method == notif::Exit::METHOD => return Ok(()),
                 Message::Request(req) => self.dispatch_request(req).await,
                 Message::Notification(n) => self.dispatch_notification(n).await,
                 Message::Response(resp) => {
@@ -118,9 +129,11 @@ impl Server {
                 }
             }
         }
+
+        Err(ProtocolError::Recv)
     }
 
-    async fn init(&mut self, init_params: InitializeParams) {
+    async fn init(&mut self, init_params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("Initialize: {init_params:?}");
 
         let root_path = match init_params
@@ -140,7 +153,7 @@ impl Server {
                 match wait_for_process(pid).await {
                     Ok(()) => {
                         // Use exit notification to force exit.
-                        let _ = lsp_tx
+                        let _: Result<_, _> = lsp_tx
                             .send(Message::Notification(Notification {
                                 method: notif::Exit::METHOD.into(),
                                 params: Default::default(),
@@ -154,6 +167,16 @@ impl Server {
             });
         }
 
+        Ok(InitializeResult {
+            capabilities: server_capabilities(),
+            server_info: Some(ServerInfo {
+                name: "nil".into(),
+                version: option_env!("CFG_RELEASE").map(Into::into),
+            }),
+        })
+    }
+
+    async fn initialized(&mut self) {
         // Load configurations before loading flake.
         // The latter depends on `nix.binary`.
         self.load_config(|st| {
@@ -223,7 +246,11 @@ impl Server {
                                 &nix_binary,
                                 &nixpkgs_path,
                             );
-                            let _: Result<_, _> = event_tx.send(Event::NixosOptions(p)).await;
+                            event_tx
+                                .blocking_send(Event::NixosOptions(ret))
+                                // No Debug.
+                                .map_err(|_| ())
+                                .expect("Channel closed");
                         });
                     }
 
@@ -269,13 +296,23 @@ impl Server {
             }
         };
 
-        let dispatcher = RequestDispatcher(self, Some(req));
-        if uninitialized {
-            return dispatcher.on_mut(Self::init).await.finish().await;
+        let state = self.state;
+        let dispatcher = RequestDispatcher::Request(self, req);
+
+        match state {
+            State::Uninitialized => {
+                return dispatcher
+                    .on_mut::<req::Initialize, _>(Self::init)
+                    .finish()
+                    .await;
+            }
+            State::Initializing | State::ShuttingDown => return dispatcher.finish().await,
+            State::Running => {}
         }
+
         dispatcher
-            .on_mut::<req::Shutdown>(|st, ()| {
-                st.is_shutdown = true;
+            .on_mut::<req::Shutdown, _>(|this, ()| async {
+                this.state = State::ShuttingDown;
                 Ok(())
             })
             .on::<req::GotoDefinition>(handler::goto_definition)
@@ -297,7 +334,7 @@ impl Server {
     }
 
     async fn dispatch_notification(&mut self, notif: Notification) {
-        NotificationDispatcher(self, Some(notif))
+        NotificationDispatcher::Notification(self, notif)
             .on_mut::<notif::Cancel, _>(|st, params| async {
                 let id: RequestId = match params.id {
                     NumberOrString::Number(id) => id.into(),
@@ -602,6 +639,7 @@ impl Server {
                         version,
                         diagnostics: Vec::new(),
                     })
+                    .await
                     .unwrap();
             }
         }
@@ -611,10 +649,7 @@ impl Server {
 #[must_use = "RequestDispatcher::finish not called"]
 enum RequestDispatcher<'s> {
     Request(&'s mut Server, Request),
-    Dispatched(
-        mpsc::Sender<Message>,
-        Box<dyn Future<Output = Result<Response>> + 's>,
-    ),
+    Dispatched(Box<dyn Future<Output = ()> + 's>),
 }
 
 impl<'s> RequestDispatcher<'s> {
@@ -624,15 +659,22 @@ impl<'s> RequestDispatcher<'s> {
         Fut: Future<Output = Result<R::Result>>,
     {
         match self {
-            Self::Request(server, req) if req.method == R::METHOD => Self::Dispatched(
-                server.lsp_tx.clone(),
-                Box::new(async {
-                    let params = serde_json::from_value::<R::Params>(req.params)?;
-                    let ret = f(server, params).await?;
-                    let ret = serde_json::to_value(ret).unwrap();
-                    Ok(result_to_response(req.id, ret))
-                }),
-            ),
+            Self::Request(server, req) if req.method == R::METHOD => {
+                Self::Dispatched(Box::new(async {
+                    let ret = async {
+                        let params = serde_json::from_value::<R::Params>(req.params)?;
+                        let ret = f(server, params).await?;
+                        Ok(serde_json::to_value(ret).unwrap())
+                    }
+                    .await;
+                    let resp = result_to_response(req.id, ret);
+                    server
+                        .lsp_tx
+                        .send(resp.into())
+                        .await
+                        .expect("Channel closed");
+                }))
+            }
             _ => self,
         }
     }
@@ -646,9 +688,8 @@ impl<'s> RequestDispatcher<'s> {
         match self {
             Self::Request(server, req) if req.method == R::METHOD => {
                 Self::Dispatched(Box::new(async {
-                    let req = self.1.take().unwrap();
-                    let snap = self.0.snapshot();
-                    let lsp_tx = self.0.lsp_tx.clone();
+                    let snap = server.snapshot();
+                    let lsp_tx = server.lsp_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         let ret = with_catch_unwind(R::METHOD, || {
                             let params = serde_json::from_value::<R::Params>(req.params)?;
@@ -656,7 +697,7 @@ impl<'s> RequestDispatcher<'s> {
                             Ok(serde_json::to_value(resp)?)
                         });
                         let resp = result_to_response(req.id, ret);
-                        let _ = lsp_tx.blocking_send(resp.into());
+                        lsp_tx.blocking_send(resp.into()).expect("Channel closed");
                     });
                 }))
             }
@@ -666,49 +707,58 @@ impl<'s> RequestDispatcher<'s> {
 
     async fn finish(self) {
         match self {
-            Self::Request(_, req) => {
-                Response::new_err(req.id, ErrorCode::MethodNotFound as _, String::new())
+            RequestDispatcher::Request(server, req) => {
+                let resp = Response::new_err(req.id, ErrorCode::MethodNotFound as _, String::new());
+                server
+                    .lsp_tx
+                    .send(resp.into())
+                    .await
+                    .expect("Channel closed");
             }
-            Self::Dispatched(fut) => fut.await,
+            RequestDispatcher::Dispatched(fut) => Box::into_pin(fut).await,
         }
-        self.0
-            .lsp_tx
-            .send(resp.into())
-            .await
-            .expect("Channel closed");
     }
 }
 
 #[must_use = "NotificationDispatcher::finish not called"]
-struct NotificationDispatcher<'s>(&'s mut Server, Option<Notification>);
+enum NotificationDispatcher<'s> {
+    Notification(&'s mut Server, Notification),
+    Dispatched(Box<dyn Future<Output = ()> + 's>),
+}
 
 impl<'s> NotificationDispatcher<'s> {
     async fn on_mut<N, Fut>(
-        mut self,
+        self,
         f: fn(&mut Server, N::Params) -> Fut,
     ) -> NotificationDispatcher<'s>
     where
         N: notif::Notification,
-        Fut: Future<Output = ()>,
+        N::Params: 's,
+        Fut: Future<Output = ()> + 's,
     {
-        if matches!(&self.1, Some(notif) if notif.method == N::METHOD) {
-            match serde_json::from_value::<N::Params>(self.1.take().unwrap().params) {
-                Ok(params) => {
-                    f(self.0, params).await;
-                }
-                Err(err) => {
-                    tracing::error!("Failed to parse notification {}: {}", N::METHOD, err);
-                }
+        match self {
+            Self::Notification(server, n) if n.method == N::METHOD => {
+                Self::Dispatched(Box::new(async move {
+                    match serde_json::from_value::<N::Params>(n.params) {
+                        Ok(params) => f(server, params).await,
+                        Err(err) => {
+                            tracing::error!("Failed to parse notification {}: {}", N::METHOD, err)
+                        }
+                    }
+                }))
             }
+            _ => self,
         }
-        self
     }
 
-    fn finish(self) {
-        if let Some(notif) = self.1 {
-            if !notif.method.starts_with("$/") {
-                tracing::error!("Unhandled notification: {:?}", notif);
+    async fn finish(self) {
+        match self {
+            Self::Notification(_, n) => {
+                if !n.method.starts_with("$/") {
+                    tracing::error!("Unhandled notification: {:?}", n);
+                }
             }
+            Self::Dispatched(fut) => Box::into_pin(fut).await,
         }
     }
 }
