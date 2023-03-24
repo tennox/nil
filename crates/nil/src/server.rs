@@ -1,12 +1,9 @@
-use crate::capabilities::server_capabilities;
+use crate::cfield2pabilities::server_capabilities;
 use crate::config::{Config, CONFIG_KEY};
 use crate::{convert, handler, lsp_ext, LspError, UrlExt, Vfs, MAX_FILE_LEN};
 use anyhow::{anyhow, bail, Context, Result};
-use crossbeam_channel::{Receiver, Sender};
 use ide::{Analysis, AnalysisHost, Cancelled, FlakeInfo, VfsPath};
-use lsp_server::{
-    Connection, ErrorCode, Message, Notification, ReqQueue, Request, RequestId, Response,
-};
+use lsp_server::{ErrorCode, Message, Notification, ReqQueue, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::{
     notification as notif, request as req, ConfigurationItem, ConfigurationParams, Diagnostic,
@@ -18,11 +15,14 @@ use nix_interop::{flake_lock, FLAKE_FILE, FLAKE_LOCK_FILE};
 use std::backtrace::Backtrace;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::panic::UnwindSafe;
 use std::path::Path;
 use std::sync::{Arc, Once, RwLock};
-use std::{fs, panic, thread};
+use std::{fs, panic};
+use tokio::sync::mpsc;
 
 const NIXOS_OPTIONS_FLAKE_INPUT: &str = "nixpkgs";
 
@@ -52,22 +52,29 @@ enum LoadFlakeResult {
 
 pub struct Server {
     // States.
+    state: State,
     /// This contains an internal RWLock and must not lock together with `vfs`.
     host: AnalysisHost,
     vfs: Arc<RwLock<Vfs>>,
     opened_files: HashMap<Url, FileData>,
     config: Arc<Config>,
-    is_shutdown: bool,
     /// Monotonic version counter for diagnostics calculation ordering.
     version_counter: u64,
 
     // Message passing.
-    req_queue: ReqQueue<(), ReqHandler>,
-    lsp_tx: Sender<Message>,
-    lsp_rx: Receiver<Message>,
-    task_tx: Sender<Task>,
-    event_tx: Sender<Event>,
-    event_rx: Receiver<Event>,
+    req_queue: ReqQueue<Infallible, ReqHandler>,
+    lsp_tx: mpsc::Sender<Message>,
+    lsp_rx: mpsc::Receiver<Message>,
+    event_tx: mpsc::Sender<Event>,
+    event_rx: mpsc::Receiver<Event>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum State {
+    Uninitialized,
+    Initializing,
+    Running,
+    ShuttingDown,
 }
 
 #[derive(Debug, Default)]
@@ -77,55 +84,44 @@ struct FileData {
 }
 
 impl Server {
-    pub fn new(lsp_tx: Sender<Message>, lsp_rx: Receiver<Message>) -> Self {
-        let (task_tx, task_rx) = crossbeam_channel::unbounded();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let worker_cnt = thread::available_parallelism().map_or(1, |n| n.get());
-        for _ in 0..worker_cnt {
-            let task_rx = task_rx.clone();
-            let event_tx = event_tx.clone();
-            thread::Builder::new()
-                .name("Worker".into())
-                .spawn(move || Self::worker(task_rx, event_tx))
-                .expect("Failed to spawn worker threads");
-        }
-        tracing::info!("Started {worker_cnt} workers");
+    pub fn new(lsp_tx: mpsc::Sender<Message>, lsp_rx: mpsc::Receiver<Message>) -> Self {
+        // Arbitrary chosen size.
+        let (event_tx, event_rx) = mpsc::channel(8);
 
         Self {
+            state: State::Uninitialized,
             host: AnalysisHost::default(),
             vfs: Arc::new(RwLock::new(Vfs::new())),
             opened_files: HashMap::default(),
             // Will be initialized in `Server::run`.
             config: Arc::new(Config::new("/non-existing-path".into())),
-            is_shutdown: false,
             version_counter: 0,
 
             req_queue: ReqQueue::default(),
             lsp_tx,
             lsp_rx,
-            task_tx,
             event_tx,
             event_rx,
         }
     }
 
-    fn worker(task_rx: Receiver<Task>, event_tx: Sender<Event>) {
-        while let Ok(task) = task_rx.recv() {
-            if event_tx.send(task()).is_err() {
-                break;
+    pub async fn main_loop(mut self) {
+        loop {
+            match self.lsp_rx.recv().await.expect("Channel closed") {
+                Message::Notification(n) if n.method == notif::Exit::METHOD => return,
+                Message::Request(req) => self.dispatch_request(req).await,
+                Message::Notification(n) => self.dispatch_notification(n).await,
+                Message::Response(resp) => {
+                    if let Some(cb) = self.req_queue.outgoing.complete(resp.id.clone()) {
+                        cb(&mut self, resp);
+                    }
+                }
             }
         }
     }
 
-    pub fn run(mut self) -> Result<()> {
-        let init_params = Connection {
-            sender: self.lsp_tx.clone(),
-            receiver: self.lsp_rx.clone(),
-        }
-        .initialize(serde_json::to_value(server_capabilities()).unwrap())?;
-        tracing::info!("Init params: {}", init_params);
-        let init_params = serde_json::from_value::<InitializeParams>(init_params)
-            .context("Invalid init_params")?;
+    async fn init(&mut self, init_params: InitializeParams) {
+        tracing::info!("Initialize: {init_params:?}");
 
         let root_path = match init_params
             .root_uri
@@ -133,12 +129,29 @@ impl Server {
             .and_then(|uri| uri.to_file_path().ok())
         {
             Some(path) => path,
-            None => std::env::current_dir().context("Failed to the current directory")?,
+            None => std::env::current_dir().expect("Failed to get the current directory"),
         };
         *Arc::get_mut(&mut self.config).expect("No concurrent access yet") = Config::new(root_path);
 
+        // Client monitor to prevent outselves getting leaked.
         if let Some(pid) = init_params.process_id {
-            self.spawn_wait_for_process(pid);
+            let lsp_tx = self.lsp_tx.clone();
+            tokio::spawn(async move {
+                match wait_for_process(pid).await {
+                    Ok(()) => {
+                        // Use exit notification to force exit.
+                        let _ = lsp_tx
+                            .send(Message::Notification(Notification {
+                                method: notif::Exit::METHOD.into(),
+                                params: Default::default(),
+                            }))
+                            .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to monitor client process: {err}");
+                    }
+                }
+            });
         }
 
         // Load configurations before loading flake.
@@ -147,86 +160,12 @@ impl Server {
             // TODO: Register file watcher for flake.lock.
             st.load_flake();
         });
-
-        loop {
-            crossbeam_channel::select! {
-                recv(self.lsp_rx) -> msg => {
-                    match msg.context("Channel closed")? {
-                        Message::Request(req) => self.dispatch_request(req),
-                        Message::Notification(notif) => {
-                            if notif.method == notif::Exit::METHOD {
-                                return Ok(());
-                            }
-                            self.dispatch_notification(notif);
-                        }
-                        Message::Response(resp) => {
-                            if let Some(callback) = self.req_queue.outgoing.complete(resp.id.clone()) {
-                                callback(&mut self, resp);
-                            }
-                        }
-                    }
-                }
-                recv(self.event_rx) -> event => {
-                    self.dispatch_event(event.context("Worker panicked")?)?;
-                }
-            }
-        }
     }
 
-    #[cfg(target_os = "linux")]
-    fn spawn_wait_for_process(&self, pid: u32) {
-        use std::io;
-        use std::mem::MaybeUninit;
-        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-        use std::ptr::null_mut;
-
-        fn wait_remote_pid(pid: libc::pid_t) -> Result<(), io::Error> {
-            let pidfd = unsafe {
-                let ret = libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_int);
-                if ret == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                OwnedFd::from_raw_fd(ret as RawFd)
-            };
-            unsafe {
-                let mut fdset = MaybeUninit::uninit();
-                libc::FD_ZERO(fdset.as_mut_ptr());
-                libc::FD_SET(pidfd.as_raw_fd(), fdset.as_mut_ptr());
-                let nfds = pidfd.as_raw_fd() + 1;
-                let ret =
-                    libc::select(nfds, fdset.as_mut_ptr(), null_mut(), null_mut(), null_mut());
-                if ret == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        }
-
-        let event_tx = self.event_tx.clone();
-        thread::spawn(move || {
-            match wait_remote_pid(pid as _) {
-                Ok(()) => {}
-                Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
-                Err(err) => {
-                    tracing::warn!("Failed to monitor parent pid {}: {}", pid, err);
-                    return;
-                }
-            }
-            let _ = event_tx.send(Event::ClientExited);
-        });
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn spawn_wait_for_process(&self, _pid: u32) {
-        tracing::warn!("Waitint arbitrary PID is not supported on this platform");
-    }
-
-    fn dispatch_event(&mut self, event: Event) -> Result<()> {
+    async fn dispatch_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Response(resp) => {
-                if let Some(()) = self.req_queue.incoming.complete(resp.id.clone()) {
-                    self.lsp_tx.send(resp.into()).unwrap();
-                }
+                todo!()
             }
             Event::Diagnostics {
                 uri,
@@ -278,14 +217,14 @@ impl Server {
                         let nixpkgs_path = nixpkgs_path.to_owned();
                         let nix_binary = self.config.nix_binary.clone();
                         tracing::info!("Evaluating NixOS options from {}", nixpkgs_path.display());
-                        self.task_tx
-                            .send(Box::new(move || {
-                                Event::NixosOptions(nix_interop::nixos_options::eval_all_options(
-                                    &nix_binary,
-                                    &nixpkgs_path,
-                                ))
-                            }))
-                            .unwrap();
+                        let event_tx = self.event_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let ret = nix_interop::nixos_options::eval_all_options(
+                                &nix_binary,
+                                &nixpkgs_path,
+                            );
+                            let _: Result<_, _> = event_tx.send(Event::NixosOptions(p)).await;
+                        });
                     }
 
                     self.vfs.write().unwrap().set_flake_info(Some(flake_info));
@@ -315,19 +254,27 @@ impl Server {
         Ok(())
     }
 
-    fn dispatch_request(&mut self, req: Request) {
-        if self.is_shutdown {
-            let resp = Response::new_err(
-                req.id,
-                ErrorCode::InvalidRequest as i32,
-                "Shutdown already requested.".into(),
-            );
-            self.lsp_tx.send(resp.into()).unwrap();
-            return;
-        }
+    async fn dispatch_request(&mut self, req: Request) {
+        let uninitialized = match self.state {
+            State::Uninitialized => true,
+            State::Initializing | State::Running => false,
+            State::ShuttingDown => {
+                let resp = Response::new_err(
+                    req.id,
+                    ErrorCode::InvalidRequest as i32,
+                    "Server is shutting down".into(),
+                );
+                self.lsp_tx.send(resp.into()).await.expect("Channel closed");
+                return;
+            }
+        };
 
-        RequestDispatcher(self, Some(req))
-            .on_sync_mut::<req::Shutdown>(|st, ()| {
+        let dispatcher = RequestDispatcher(self, Some(req));
+        if uninitialized {
+            return dispatcher.on_mut(Self::init).await.finish().await;
+        }
+        dispatcher
+            .on_mut::<req::Shutdown>(|st, ()| {
                 st.is_shutdown = true;
                 Ok(())
             })
@@ -349,9 +296,9 @@ impl Server {
             .finish();
     }
 
-    fn dispatch_notification(&mut self, notif: Notification) {
+    async fn dispatch_notification(&mut self, notif: Notification) {
         NotificationDispatcher(self, Some(notif))
-            .on_sync_mut::<notif::Cancel>(|st, params| {
+            .on_mut::<notif::Cancel, _>(|st, params| async {
                 let id: RequestId = match params.id {
                     NumberOrString::Number(id) => id.into(),
                     NumberOrString::String(id) => id.into(),
@@ -360,7 +307,7 @@ impl Server {
                     st.lsp_tx.send(resp.into()).unwrap();
                 }
             })
-            .on_sync_mut::<notif::DidOpenTextDocument>(|st, params| {
+            .on_mut::<notif::DidOpenTextDocument, _>(|st, params| async {
                 // Ignore the open event for unsupported files, thus all following interactions
                 // will error due to unopened files.
                 let len = params.text_document.text.len();
@@ -375,11 +322,11 @@ impl Server {
                 st.set_vfs_file_content(uri, params.text_document.text);
                 st.opened_files.insert(uri.clone(), FileData::default());
             })
-            .on_sync_mut::<notif::DidCloseTextDocument>(|st, params| {
+            .on_mut::<notif::DidCloseTextDocument, _>(|st, params| async {
                 // N.B. Don't clear text here.
                 st.opened_files.remove(&params.text_document.uri);
             })
-            .on_sync_mut::<notif::DidChangeTextDocument>(|st, params| {
+            .on_mut::<notif::DidChangeTextDocument, _>(|st, params| async {
                 let mut vfs = st.vfs.write().unwrap();
                 let uri = &params.text_document.uri;
                 // Ignore files not maintained in Vfs.
@@ -407,16 +354,20 @@ impl Server {
                 drop(vfs);
                 st.apply_vfs_change();
             })
+            .await
             // As stated in https://github.com/microsoft/language-server-protocol/issues/676,
             // this notification's parameters should be ignored and the actual config queried separately.
-            .on_sync_mut::<notif::DidChangeConfiguration>(|st, _params| {
+            .on_mut::<notif::DidChangeConfiguration, _>(|st, _params| async {
                 st.load_config(|_| {});
             })
+            .await
             // Workaround:
             // > In former implementations clients pushed file events without the server actively asking for it.
             // Ref: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_didChangeWatchedFiles
-            .on_sync_mut::<notif::DidChangeWatchedFiles>(|_st, _params| {})
-            .finish();
+            .on_mut::<notif::DidChangeWatchedFiles, _>(|_st, _params| async {})
+            .await
+            .finish()
+            .await;
     }
 
     /// Enqueue a task to reload the flake.{nix,lock} and the locked inputs.
@@ -658,24 +609,32 @@ impl Server {
 }
 
 #[must_use = "RequestDispatcher::finish not called"]
-struct RequestDispatcher<'s>(&'s mut Server, Option<Request>);
+enum RequestDispatcher<'s> {
+    Request(&'s mut Server, Request),
+    Dispatched(
+        mpsc::Sender<Message>,
+        Box<dyn Future<Output = Result<Response>> + 's>,
+    ),
+}
 
 impl<'s> RequestDispatcher<'s> {
-    fn on_sync_mut<R: req::Request>(
-        mut self,
-        f: fn(&mut Server, R::Params) -> Result<R::Result>,
-    ) -> Self {
-        if matches!(&self.1, Some(notif) if notif.method == R::METHOD) {
-            let req = self.1.take().unwrap();
-            let ret = (|| {
-                let params = serde_json::from_value::<R::Params>(req.params)?;
-                let v = f(self.0, params)?;
-                Ok(serde_json::to_value(v).unwrap())
-            })();
-            let resp = result_to_response(req.id, ret);
-            self.0.lsp_tx.send(resp.into()).unwrap();
+    fn on_mut<R, Fut>(mut self, f: fn(&mut Server, R::Params) -> Fut) -> Self
+    where
+        R: req::Request,
+        Fut: Future<Output = Result<R::Result>>,
+    {
+        match self {
+            Self::Request(server, req) if req.method == R::METHOD => Self::Dispatched(
+                server.lsp_tx.clone(),
+                Box::new(async {
+                    let params = serde_json::from_value::<R::Params>(req.params)?;
+                    let ret = f(server, params).await?;
+                    let ret = serde_json::to_value(ret).unwrap();
+                    Ok(result_to_response(req.id, ret))
+                }),
+            ),
+            _ => self,
         }
-        self
     }
 
     fn on<R>(mut self, f: fn(StateSnapshot, R::Params) -> Result<R::Result>) -> Self
@@ -684,28 +643,39 @@ impl<'s> RequestDispatcher<'s> {
         R::Params: 'static,
         R::Result: 'static,
     {
-        if matches!(&self.1, Some(notif) if notif.method == R::METHOD) {
-            let req = self.1.take().unwrap();
-            let snap = self.0.snapshot();
-            self.0.req_queue.incoming.register(req.id.clone(), ());
-            let task = move || {
-                let ret = with_catch_unwind(R::METHOD, || {
-                    let params = serde_json::from_value::<R::Params>(req.params)?;
-                    let resp = f(snap, params)?;
-                    Ok(serde_json::to_value(resp)?)
-                });
-                Event::Response(result_to_response(req.id, ret))
-            };
-            self.0.task_tx.send(Box::new(task)).unwrap();
+        match self {
+            Self::Request(server, req) if req.method == R::METHOD => {
+                Self::Dispatched(Box::new(async {
+                    let req = self.1.take().unwrap();
+                    let snap = self.0.snapshot();
+                    let lsp_tx = self.0.lsp_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let ret = with_catch_unwind(R::METHOD, || {
+                            let params = serde_json::from_value::<R::Params>(req.params)?;
+                            let resp = f(snap, params)?;
+                            Ok(serde_json::to_value(resp)?)
+                        });
+                        let resp = result_to_response(req.id, ret);
+                        let _ = lsp_tx.blocking_send(resp.into());
+                    });
+                }))
+            }
+            _ => self,
         }
-        self
     }
 
-    fn finish(self) {
-        if let Some(req) = self.1 {
-            let resp = Response::new_err(req.id, ErrorCode::MethodNotFound as _, String::new());
-            self.0.lsp_tx.send(resp.into()).unwrap();
+    async fn finish(self) {
+        match self {
+            Self::Request(_, req) => {
+                Response::new_err(req.id, ErrorCode::MethodNotFound as _, String::new())
+            }
+            Self::Dispatched(fut) => fut.await,
         }
+        self.0
+            .lsp_tx
+            .send(resp.into())
+            .await
+            .expect("Channel closed");
     }
 }
 
@@ -713,11 +683,18 @@ impl<'s> RequestDispatcher<'s> {
 struct NotificationDispatcher<'s>(&'s mut Server, Option<Notification>);
 
 impl<'s> NotificationDispatcher<'s> {
-    fn on_sync_mut<N: notif::Notification>(mut self, f: fn(&mut Server, N::Params)) -> Self {
+    async fn on_mut<N, Fut>(
+        mut self,
+        f: fn(&mut Server, N::Params) -> Fut,
+    ) -> NotificationDispatcher<'s>
+    where
+        N: notif::Notification,
+        Fut: Future<Output = ()>,
+    {
         if matches!(&self.1, Some(notif) if notif.method == N::METHOD) {
             match serde_json::from_value::<N::Params>(self.1.take().unwrap().params) {
                 Ok(params) => {
-                    f(self.0, params);
+                    f(self.0, params).await;
                 }
                 Err(err) => {
                     tracing::error!("Failed to parse notification {}: {}", N::METHOD, err);
@@ -812,4 +789,46 @@ impl StateSnapshot {
     pub(crate) fn vfs(&self) -> impl std::ops::Deref<Target = Vfs> + '_ {
         self.vfs.read().unwrap()
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_process(pid: u32) -> Result<()> {
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::ptr::null_mut;
+
+    fn wait_remote_pid(pid: libc::pid_t) -> Result<(), io::Error> {
+        let pidfd = unsafe {
+            let ret = libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_int);
+            if ret == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            OwnedFd::from_raw_fd(ret as RawFd)
+        };
+        unsafe {
+            let mut fdset = MaybeUninit::uninit();
+            libc::FD_ZERO(fdset.as_mut_ptr());
+            libc::FD_SET(pidfd.as_raw_fd(), fdset.as_mut_ptr());
+            let nfds = pidfd.as_raw_fd() + 1;
+            let ret = libc::select(nfds, fdset.as_mut_ptr(), null_mut(), null_mut(), null_mut());
+            if ret == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    tokio::task::spawn_blocking(move || match wait_remote_pid(pid as _) {
+        Ok(()) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(err) => return Err(err.into()),
+    })
+    .await
+    .context("Failed to spawn task")?
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wait_for_process(_pid: u32) -> Result<()> {
+    bail!("Waiting for arbitrary PID is not supported on this platform");
 }

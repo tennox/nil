@@ -9,9 +9,10 @@ mod vfs;
 
 use anyhow::Result;
 use ide::VfsPath;
-use lsp_server::{Connection, ErrorCode};
+use lsp_server::{ErrorCode, Message};
 use lsp_types::Url;
-use std::fmt;
+use std::{fmt, thread};
+use tokio::sync::mpsc;
 
 pub(crate) use server::{Server, StateSnapshot};
 pub(crate) use vfs::{LineMap, Vfs};
@@ -68,13 +69,32 @@ impl UrlExt for Url {
 }
 
 pub fn run_server_stdio() -> Result<()> {
-    let (conn, io_threads) = Connection::stdio();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("Failed to start tokio runtime");
 
-    let server = Server::new(conn.sender, conn.receiver);
-    server.run()?;
+    // Arbitrarily chosen sizes.
+    const IN_BUF_SIZE: usize = 8;
+    const OUT_BUF_SIZE: usize = 8;
+
+    let (mut in_tx, in_rx) = mpsc::channel(IN_BUF_SIZE);
+    let (out_tx, out_rx) = mpsc::channel(OUT_BUF_SIZE);
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        while let Some(msg) = Message::read(&mut stdin).expect("Invalid message from stdin") {
+            in_tx.blocking_send(msg);
+        }
+    });
+    thread::spawn(move || {
+        let mut stdout = std::io::stdout().lock();
+        while let Some(msg) = out_rx.blocking_recv() {
+            Message::write(msg, &mut stdout).expect("Failed to write to stdout");
+        }
+    });
+
+    let server = Server::new(out_tx, in_rx);
+    runtime.block_on(server.main_loop())?;
 
     tracing::info!("Leaving main loop");
-
-    io_threads.join()?;
     Ok(())
 }
