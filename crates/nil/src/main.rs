@@ -47,6 +47,10 @@ struct DiagnosticsArgs {
     /// to disambiguous it from flags.
     #[argh(positional)]
     path: PathBuf,
+
+    /// non-zero exit code on warnings
+    #[argh(switch)]
+    error_on_warnings: bool,
 }
 
 #[derive(Debug, FromArgs)]
@@ -112,7 +116,7 @@ fn main() {
 fn main_diagnostics(args: DiagnosticsArgs) {
     use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 
-    let ret = (|| -> Result<Vec<Severity>> {
+    let ret = (|| -> Result<Option<Severity>> {
         let path = &*args.path;
 
         let src = if path.as_os_str() == "-" {
@@ -130,18 +134,17 @@ fn main_diagnostics(args: DiagnosticsArgs) {
         let mut writer = StandardStream::stdout(ColorChoice::Auto);
         emit_diagnostics(path, &src, &mut writer, &mut diags.iter().cloned())?;
 
-        Ok(diags.iter().map(|diag| diag.severity())/*.unique()*/.collect())
+        Ok(diags.iter().map(|diag| diag.severity()).max())
     })();
     match ret {
-        Ok(severities) => {
-            if severities.is_empty() {
-                process::exit(0)
-            } else if severities.into_iter().any(|severity| severity != Severity::Warning) {
-                process::exit(1) // not only warnings
+        Ok(Some(max_severity)) => {
+            if max_severity > Severity::Warning || args.error_on_warnings {
+                process::exit(1)
             } else {
-                process::exit(2) // only warnings
+                process::exit(0)
             }
         }
+        Ok(None) => process::exit(0),
         Err(err) => {
             eprintln!("{err:#}");
             process::exit(1);
